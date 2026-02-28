@@ -1,0 +1,222 @@
+/**
+ * BIBLIODRIVE SUITE v6.1
+ * Integración total: Escaneo de Drive + Editor Completo (MLA 9th Ed).
+ * Campos incorporados: Tipo, Autor, Título, Año, Editorial, Revista.
+ */
+
+function doGet() {
+  const html = getHtmlInterface();
+  return HtmlService.createHtmlOutput(html)
+    .setTitle('BiblioDrive Mapper & Editor')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL)
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1');
+}
+
+// --- BACKEND: DRIVE SCANNER ---
+
+function getDriveFiles(folderId) {
+  try {
+    const rootFolder = DriveApp.getFolderById(folderId);
+    const fileList = [];
+    findFilesRecursively(rootFolder, fileList);
+    
+    return fileList.map(file => {
+      const meta = parseFileName(file.getName());
+      return {
+        id: file.getId(),
+        type: meta.year ? 'Article' : 'Book', // Guess based on simple criteria
+        author: meta.author,
+        title: meta.title,
+        year: meta.year,
+        publisher: '',
+        journal: '',
+        url: file.getUrl()
+      };
+    });
+  } catch (e) {
+    throw new Error("Error de acceso: " + e.message);
+  }
+}
+
+function findFilesRecursively(folder, fileList) {
+  const files = folder.getFilesByType(MimeType.PDF);
+  while (files.hasNext()) fileList.push(files.next());
+  const subfolders = folder.getFolders();
+  while (subfolders.hasNext()) findFilesRecursively(subfolders.next(), fileList);
+}
+
+function parseFileName(name) {
+  let cleanName = name.replace(/\.[^/.]+$/, "");
+  const yearMatch = cleanName.match(/\b(19|20)\d{2}\b/);
+  const year = yearMatch ? yearMatch[0] : "";
+  let author = "Apellido, Nombre", title = cleanName;
+
+  if (cleanName.includes("_")) {
+    const parts = cleanName.split("_");
+    author = parts[0].trim();
+    title = parts.slice(1).join("_").trim();
+  }
+  return { year, author, title };
+}
+
+// --- FRONTEND: UI & EDITOR ---
+
+function getHtmlInterface() {
+  return `
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,700;1,400&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
+  <style>
+    :root { --accent: #8b2635; --paper: #f5f2eb; --ink: #1a1a18; --rule: #c8c2b4; }
+    body { font-family: 'IBM Plex Sans', sans-serif; background: var(--paper); color: var(--ink); margin: 0; padding: 20px; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    header { display: flex; justify-content: space-between; align-items: center; border-bottom: 2px solid var(--accent); padding-bottom: 15px; margin-bottom: 30px; }
+    h1 { font-family: 'Playfair Display', serif; color: var(--accent); margin: 0; font-size: 28px; }
+    .controls { display: flex; gap: 12px; margin-bottom: 25px; }
+    button { background: var(--accent); color: white; border: none; padding: 10px 18px; border-radius: 4px; cursor: pointer; font-weight: 600; font-size: 14px; }
+    button.sec { background: #e2ddd3; color: var(--ink); border: 1px solid var(--rule); }
+    table { width: 100%; border-collapse: collapse; background: #fff; box-shadow: 0 4px 10px rgba(0,0,0,0.05); }
+    th { background: #eeece5; color: #666; font-size: 11px; text-transform: uppercase; padding: 12px; text-align: left; border-bottom: 1px solid var(--rule); }
+    td { padding: 8px; border-bottom: 1px solid #eee; }
+    input, select { width: 100%; border: 1px solid transparent; padding: 6px; background: transparent; transition: all 0.2s; }
+    input:focus, select:focus { background: #fff; border-color: var(--accent); outline: none; }
+    .mla-preview { font-family: 'Playfair Display', serif; font-size: 14px; line-height: 1.4; color: #444; }
+    .mla-preview i { font-style: italic; }
+    .loading-overlay { position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(245, 242, 235, 0.9); display: none; flex-direction: column; align-items: center; justify-content: center; z-index: 1000; }
+    .badge { font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 10px; background: #f0f0f0; margin-bottom: 4px; display: inline-block; }
+  </style>
+</head>
+<body>
+  <div id="loader" class="loading-overlay">
+    <div style="font-size: 24px; font-family: 'Playfair Display'; margin-bottom: 10px;">Escaneando Google Drive...</div>
+    <div style="color: var(--accent);">Esto puede tardar unos segundos según el número de archivos.</div>
+  </div>
+
+  <div class="container">
+    <header>
+      <h1>BiblioDrive Suite</h1>
+      <div id="counter" style="font-weight: 600;">0 Fuentes</div>
+    </header>
+
+    <div class="controls">
+      <button onclick="triggerScan()">Escanear Carpeta Drive</button>
+      <button class="sec" onclick="exportRIS()">Descargar RIS (EndNote)</button>
+      <button class="sec" onclick="copyBibliography()">Copiar Bibliografía (Texto)</button>
+    </div>
+
+    <table id="mainTable">
+      <thead>
+        <tr>
+          <th width="8%">Tipo</th>
+          <th width="15%">Autor (Apellido, N.)</th>
+          <th width="20%">Título</th>
+          <th width="6%">Año</th>
+          <th width="15%">Editorial / Revista</th>
+          <th width="36%">Vista Previa MLA (9ª Ed.)</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <script>
+    let entries = [];
+
+    function triggerScan() {
+      const folderId = prompt("Pegue el ID de la carpeta de Google Drive:");
+      if (!folderId) return;
+      document.getElementById('loader').style.display = 'flex';
+      
+      google.script.run
+        .withSuccessHandler(data => {
+          entries = data;
+          render();
+          document.getElementById('loader').style.display = 'none';
+        })
+        .withFailureHandler(err => {
+          alert(err.message);
+          document.getElementById('loader').style.display = 'none';
+        })
+        .getDriveFiles(folderId);
+    }
+
+    function render() {
+      const tbody = document.querySelector('#mainTable tbody');
+      tbody.innerHTML = '';
+      document.getElementById('counter').innerText = entries.length + ' Fuentes';
+
+      entries.forEach((e, i) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = \`
+          <td>
+            <select onchange="update(\${i}, 'type', this.value)">
+              <option value="Book" \${e.type === 'Book' ? 'selected' : ''}>Libro</option>
+              <option value="Article" \${e.type === 'Article' ? 'selected' : ''}>Artículo</option>
+              <option value="Chapter" \${e.type === 'Chapter' ? 'selected' : ''}>Capítulo</option>
+            </select>
+          </td>
+          <td><input value="\${e.author}" onchange="update(\${i}, 'author', this.value)"></td>
+          <td><input value="\${e.title}" onchange="update(\${i}, 'title', this.value)"></td>
+          <td><input value="\${e.year}" onchange="update(\${i}, 'year', this.value)" placeholder="Año"></td>
+          <td>
+            <input value="\${e.type === 'Article' ? e.journal : e.publisher}" 
+                   placeholder="\${e.type === 'Article' ? 'Revista' : 'Editorial'}"
+                   onchange="update(\${i}, '\${e.type === 'Article' ? 'journal' : 'publisher'}', this.value)">
+          </td>
+          <td class="mla-preview">\${formatMLA(e)}</td>
+        \`;
+        tbody.appendChild(tr);
+      });
+    }
+
+    function update(idx, field, val) {
+      entries[idx][field] = val;
+      render();
+    }
+
+    function formatMLA(e) {
+      let auth = e.author || "Sin Autor";
+      let tit = e.title || "Sin Título";
+      let year = e.year || "s.f.";
+      
+      if (e.type === 'Article') {
+        let jrnl = e.journal ? \`<i>\${e.journal}</i>, \` : "";
+        return \`\${auth}. "\${tit}." \${jrnl}\${year}.\`;
+      } else {
+        let pub = e.publisher ? \`\${e.publisher}, \` : "";
+        return \`\${auth}. <i>\${tit}</i>. \${pub}\${year}.\`;
+      }
+    }
+
+    function exportRIS() {
+      let ris = "";
+      entries.forEach(e => {
+        const type = e.type === 'Book' ? 'BOOK' : 'JOUR';
+        ris += \`TY  - \${type}\\nAU  - \${e.author}\\nTI  - \${e.title}\\n\`;
+        if (e.type === 'Article' && e.journal) ris += \`JO  - \${e.journal}\\n\`;
+        if (e.publisher) ris += \`PB  - \${e.publisher}\\n\`;
+        ris += \`PY  - \${e.year}\\nUR  - \${e.url}\\nER  - \\n\\n\`;
+      });
+      const blob = new Blob([ris], {type: 'text/plain'});
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'export_bibliografia.ris';
+      a.click();
+    }
+
+    function copyBibliography() {
+      const text = entries.map(e => {
+        const div = document.createElement('div');
+        div.innerHTML = formatMLA(e);
+        return div.innerText;
+      }).join('\\n');
+      navigator.clipboard.writeText(text);
+      alert("Copiado al portapapeles.");
+    }
+  </script>
+</body>
+</html>
+  `;
+}
